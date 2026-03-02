@@ -3,6 +3,7 @@ import * as crypto from "crypto";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
+import { loadConfig } from "./config";
 
 const POLL_INTERVAL_MS = 200;
 const LOG_MAX_AGE_MS = 60 * 60 * 1000; // 1 hour
@@ -12,6 +13,7 @@ let logFile: string | null = null;
 let logStartTime: number = 0;
 
 const isWindows = process.platform === "win32";
+const isMacOS = process.platform === "darwin";
 
 function isWSL(): boolean {
   if (isWindows) {
@@ -25,22 +27,12 @@ function isWSL(): boolean {
   }
 }
 
-function getLogDir(): string {
-  return path.join(os.homedir(), ".config", "clipshot", "logs");
-}
-
-function ensureLogDir(): void {
-  const logDir = getLogDir();
-  if (!fs.existsSync(logDir)) {
-    fs.mkdirSync(logDir, { recursive: true });
-  }
-}
+const LOG_DIR = path.join(os.homedir(), ".config", "clipshot", "logs");
 
 function createNewLogFile(): string {
-  ensureLogDir();
+  fs.mkdirSync(LOG_DIR, { recursive: true });
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-  const filename = `clipshot-${timestamp}.log`;
-  return path.join(getLogDir(), filename);
+  return path.join(LOG_DIR, `clipshot-${timestamp}.log`);
 }
 
 function log(message: string): void {
@@ -90,7 +82,7 @@ if ($img -ne $null) {
       windowsHide: true,
     }).trim();
 
-    if (!windowsPath || windowsPath.length === 0) {
+    if (!windowsPath) {
       return null;
     }
 
@@ -146,9 +138,64 @@ async function getClipboardImageNative(): Promise<Buffer | null> {
   }
 }
 
+let macClipboardScriptPath: string | null = null;
+const macTempImagePath = path.join(os.tmpdir(), "clipshot-cb.png");
+
+function ensureMacClipboardScript(): string {
+  if (!macClipboardScriptPath) {
+    const scriptPath = path.join(os.tmpdir(), "clipshot-get-clipboard.applescript");
+    const script = `use framework "AppKit"
+use scripting additions
+set pb to current application's NSPasteboard's generalPasteboard()
+set imgData to pb's dataForType:"public.png"
+if imgData is not missing value then
+    imgData's writeToFile:"${macTempImagePath}" atomically:true
+    return "OK"
+end if
+set imgData to pb's dataForType:"public.tiff"
+if imgData is not missing value then
+    set bitmapRep to current application's NSBitmapImageRep's imageRepWithData:imgData
+    set pngData to (bitmapRep's representationUsingType:4 |properties|:(missing value))
+    pngData's writeToFile:"${macTempImagePath}" atomically:true
+    return "OK"
+end if
+return "NO_IMAGE"`;
+    fs.writeFileSync(scriptPath, script);
+    macClipboardScriptPath = scriptPath;
+  }
+  return macClipboardScriptPath;
+}
+
+async function getClipboardImageMacOS(): Promise<Buffer | null> {
+  try {
+    const scriptPath = ensureMacClipboardScript();
+    const result = execSync(`osascript "${scriptPath}"`, {
+      encoding: "utf8",
+      timeout: 5000,
+    }).trim();
+
+    if (result === "NO_IMAGE") {
+      return null;
+    }
+
+    if (fs.existsSync(macTempImagePath)) {
+      const imageBuffer = fs.readFileSync(macTempImagePath);
+      fs.unlinkSync(macTempImagePath);
+      return imageBuffer.length > 0 ? imageBuffer : null;
+    }
+
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 async function getClipboardImage(): Promise<Buffer | null> {
   if (isWindows || isWSL()) {
     return getClipboardImageWindows();
+  }
+  if (isMacOS) {
+    return getClipboardImageMacOS();
   }
   return getClipboardImageNative();
 }
@@ -158,22 +205,16 @@ function getImageHash(buffer: Buffer): string {
 }
 
 function generateFilename(): string {
-  const now = new Date();
-  const timestamp = now.toISOString().replace(/[:.]/g, "-").slice(0, 19);
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
   return `screenshot-${timestamp}.png`;
 }
 
-function getLocalScreenshotDir(): string {
-  return path.join(os.homedir(), "clipshot-screenshots");
-}
+const LOCAL_SCREENSHOT_DIR = "/tmp/clipshot-screenshots";
 
 function saveLocal(imageBuffer: Buffer, filename: string): { success: boolean; path: string } {
-  const dir = getLocalScreenshotDir();
-  const filePath = path.join(dir, filename);
+  const filePath = path.join(LOCAL_SCREENSHOT_DIR, filename);
   try {
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
-    }
+    fs.mkdirSync(LOCAL_SCREENSHOT_DIR, { recursive: true });
     fs.writeFileSync(filePath, imageBuffer);
     return { success: true, path: filePath };
   } catch {
@@ -181,26 +222,14 @@ function saveLocal(imageBuffer: Buffer, filename: string): { success: boolean; p
   }
 }
 
-function getRemoteHomePath(remote: string): string {
-  // Extract username from user@host format
-  const match = remote.match(/^([^@]+)@/);
-  if (match) {
-    const user = match[1];
-    return user === "root" ? "/root" : `/home/${user}`;
-  }
-  // Named host without user - fall back to ~
-  return "~";
-}
-
 async function pipeToRemote(imageBuffer: Buffer, remote: string, filename: string): Promise<{ success: boolean; path: string; error?: string }> {
-  const homeDir = getRemoteHomePath(remote);
-  const remotePath = `${homeDir}/clipshot-screenshots/${filename}`;
+  const remoteDir = "/tmp/clipshot-screenshots";
+  const remotePath = `${remoteDir}/${filename}`;
 
   return new Promise((resolve) => {
-    // Use ~ in the command so SSH resolves it correctly
     const proc = spawn("ssh", [
       remote,
-      `mkdir -p ~/clipshot-screenshots && cat > ~/clipshot-screenshots/${filename}`
+      `mkdir -p ${remoteDir} && cat > ${remotePath}`
     ], {
       windowsHide: true,
     });
@@ -214,7 +243,6 @@ async function pipeToRemote(imageBuffer: Buffer, remote: string, filename: strin
     proc.stdin.end();
 
     proc.on("close", (code) => {
-      // Return the explicit path for clipboard, but command used ~ for reliability
       resolve({ success: code === 0, path: remotePath, error: stderr.trim() || undefined });
     });
 
@@ -224,36 +252,39 @@ async function pipeToRemote(imageBuffer: Buffer, remote: string, filename: strin
   });
 }
 
-function copyToClipboardWindows(text: string): void {
+function setRemoteClipboard(remote: string, filePath: string, display: string): void {
+  try {
+    // Kill previous xclip owner so the new one can take over
+    execSync(
+      `ssh ${remote} 'pkill -x xclip 2>/dev/null; true'`,
+      { timeout: 3000, stdio: "ignore" }
+    );
+    // Run xclip in detached nohup so it persists after SSH exits.
+    // xclip must stay alive to own the X clipboard selection.
+    execSync(
+      `ssh ${remote} 'DISPLAY=${display} nohup xclip -selection clipboard -t image/png -i ${filePath} </dev/null >/dev/null 2>&1 &'`,
+      { timeout: 5000, stdio: "ignore" }
+    );
+  } catch {
+    // Ignore - clipboard setting is best-effort
+  }
+}
+
+function copyToClipboard(text: string): void {
+  const escaped = text.replace(/'/g, "'\\''");
   try {
     if (isWindows) {
-      // On native Windows, use PowerShell's Set-Clipboard
-      const escaped = text.replace(/'/g, "''");
-      execSync(`powershell -NoProfile -WindowStyle Hidden -Command "Set-Clipboard -Value '${escaped}'"`, { timeout: 2000, windowsHide: true });
+      const psEscaped = text.replace(/'/g, "''");
+      execSync(`powershell -NoProfile -WindowStyle Hidden -Command "Set-Clipboard -Value '${psEscaped}'"`, { timeout: 2000, windowsHide: true });
+    } else if (isWSL()) {
+      execSync(`echo -n '${escaped}' | clip.exe`, { timeout: 2000 });
+    } else if (isMacOS) {
+      execSync(`printf '%s' '${escaped}' | pbcopy`, { timeout: 2000 });
     } else {
-      // On WSL, use clip.exe
-      execSync(`echo -n '${text.replace(/'/g, "'\\''")}' | clip.exe`, { timeout: 2000 });
+      execSync(`printf '%s' '${escaped}' | xclip -selection clipboard`, { timeout: 2000 });
     }
   } catch {
     // Ignore clipboard errors
-  }
-}
-
-async function copyToClipboardNative(text: string): Promise<void> {
-  try {
-    // Use xclip to set clipboard text
-    const escaped = text.replace(/'/g, "'\\''");
-    execSync(`echo -n '${escaped}' | xclip -selection clipboard`, { timeout: 2000 });
-  } catch {
-    // Ignore clipboard errors
-  }
-}
-
-async function copyToClipboard(text: string): Promise<void> {
-  if (isWindows || isWSL()) {
-    copyToClipboardWindows(text);
-  } else {
-    await copyToClipboardNative(text);
   }
 }
 
@@ -262,13 +293,17 @@ export async function startMonitor(remote: string): Promise<void> {
   logFile = createNewLogFile();
   logStartTime = Date.now();
 
+  const config = loadConfig();
+  const display = config?.display || ":0";
+
   const wsl = isWSL();
   const env = isWindows ? "Windows" : (wsl ? "WSL" : "Native");
   log(`Starting monitor for: ${remote}`);
   log(`Environment: ${env}`);
+  log(`Display: ${display}`);
   log(`Log file: ${logFile}`);
   if (remote === "local") {
-    log(`Saving to: ${getLocalScreenshotDir()}`);
+    log(`Saving to: ${LOCAL_SCREENSHOT_DIR}`);
   }
   log("");
   log("Monitoring clipboard... (Ctrl+C to stop)");
@@ -301,7 +336,7 @@ export async function startMonitor(remote: string): Promise<void> {
           const result = saveLocal(imageBuffer, filename);
           if (result.success) {
             log(`  -> Saved: ${result.path}`);
-            await copyToClipboard(result.path);
+            copyToClipboard(result.path);
             log(`  -> Copied to clipboard`);
           } else {
             log(`  -> Failed to save locally`);
@@ -310,8 +345,19 @@ export async function startMonitor(remote: string): Promise<void> {
           const result = await pipeToRemote(imageBuffer, remote, filename);
           if (result.success) {
             log(`  -> Sent to ${remote}:${result.path}`);
-            await copyToClipboard(result.path);
-            log(`  -> Copied to clipboard`);
+            // Set the remote X clipboard so Ctrl+V works in Claude Code over SSH
+            setRemoteClipboard(remote, result.path, display);
+            log(`  -> Set remote clipboard`);
+            // Also save locally so the image is accessible on this machine
+            const localResult = saveLocal(imageBuffer, filename);
+            if (localResult.success) {
+              copyToClipboard(localResult.path);
+              log(`  -> Local copy: ${localResult.path}`);
+              log(`  -> Copied local path to clipboard`);
+            } else {
+              copyToClipboard(result.path);
+              log(`  -> Copied remote path to clipboard`);
+            }
           } else {
             log(`  -> Failed to send to ${remote}`);
             if (result.error) {

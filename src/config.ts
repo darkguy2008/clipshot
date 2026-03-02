@@ -10,6 +10,7 @@ export interface SSHHost {
 
 export interface Config {
   remotes: string[];
+  display?: string;
 }
 
 export function getConfigPath(): string {

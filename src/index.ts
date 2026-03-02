@@ -249,14 +249,16 @@ async function runConfig(): Promise<Config> {
     }
 
     const remotes = await addRemotes([]);
-    config = { remotes };
+    const display = await promptInput("Remote X11 display number (default :0)") || ":0";
+    config = { remotes, display };
     saveConfig(config);
 
     if (remotes.length > 0) {
-      console.log(`\nSaved ${remotes.length} remote(s).`);
+      console.log(`\nSaved ${remotes.length} remote(s). Display: ${display}`);
     }
   } else {
-    console.log(`SSH remotes: ${config.remotes.join(", ")}\n`);
+    console.log(`SSH remotes: ${config.remotes.join(", ")}`);
+    console.log(`X11 display: ${config.display || ":0"}\n`);
 
     const modify = await promptConfirm("Modify remotes?");
     if (modify) {
@@ -266,9 +268,10 @@ async function runConfig(): Promise<Config> {
       );
 
       const remotes = await addRemotes(toKeep);
-      config = { remotes };
+      const display = await promptInput(`Remote X11 display number (current: ${config.display || ":0"})`) || config.display || ":0";
+      config = { remotes, display };
       saveConfig(config);
-      console.log(`\nSaved ${remotes.length} remote(s).`);
+      console.log(`\nSaved ${remotes.length} remote(s). Display: ${display}`);
     }
   }
 
