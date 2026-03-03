@@ -351,12 +351,7 @@ export async function startMonitor(remote: string): Promise<void> {
             // Also save locally so the image is accessible on this machine
             const localResult = saveLocal(imageBuffer, filename);
             if (localResult.success) {
-              copyToClipboard(localResult.path);
               log(`  -> Local copy: ${localResult.path}`);
-              log(`  -> Copied local path to clipboard`);
-            } else {
-              copyToClipboard(result.path);
-              log(`  -> Copied remote path to clipboard`);
             }
           } else {
             log(`  -> Failed to send to ${remote}`);
