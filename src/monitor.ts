@@ -3,6 +3,7 @@ import * as crypto from "crypto";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
+import * as readline from "readline";
 import { loadConfig } from "./config";
 
 const POLL_INTERVAL_MS = 200;
@@ -190,6 +191,96 @@ async function getClipboardImageMacOS(): Promise<Buffer | null> {
   }
 }
 
+function startMacClipboardHelper() {
+  try {
+    const script = `use framework "Foundation"
+use framework "AppKit"
+use scripting additions
+
+set stdout to current application's NSFileHandle's fileHandleWithStandardOutput()
+set tempPath to "${macTempImagePath}"
+
+on writeLine(msg)
+    set theData to (current application's NSString's stringWithString:(msg & linefeed))'s dataUsingEncoding:4
+    my stdout's writeData:theData
+end writeLine
+
+set pb to current application's NSPasteboard's generalPasteboard()
+set lastCount to pb's changeCount() as integer
+my writeLine("READY")
+
+repeat
+    set currentCount to pb's changeCount() as integer
+    if currentCount is not lastCount then
+        set lastCount to currentCount
+        set imgData to pb's dataForType:"public.png"
+        if imgData is not missing value then
+            imgData's writeToFile:tempPath atomically:true
+            my writeLine("IMAGE " & tempPath)
+        else
+            set imgData to pb's dataForType:"public.tiff"
+            if imgData is not missing value then
+                set bitmapRep to current application's NSBitmapImageRep's imageRepWithData:imgData
+                set pngData to (bitmapRep's representationUsingType:4 |properties|:(missing value))
+                pngData's writeToFile:tempPath atomically:true
+                my writeLine("IMAGE " & tempPath)
+            else
+                my writeLine("NO_IMAGE")
+            end if
+        end if
+    end if
+    delay 0.2
+end repeat`;
+
+    const child = spawn("osascript", ["-"], {
+      stdio: ["pipe", "pipe", "ignore"],
+    });
+    child.stdin!.write(script);
+    child.stdin!.end();
+    return child;
+  } catch {
+    return null;
+  }
+}
+
+async function handleNewImage(imageBuffer: Buffer, remote: string, display: string): Promise<void> {
+  const currentHash = getImageHash(imageBuffer);
+  if (currentHash === lastImageHash) return;
+  lastImageHash = currentHash;
+
+  const filename = generateFilename();
+  const size = Math.round(imageBuffer.length / 1024);
+
+  log(`New screenshot: ${filename} (${size}KB)`);
+
+  if (remote === "local") {
+    const result = saveLocal(imageBuffer, filename);
+    if (result.success) {
+      log(`  -> Saved: ${result.path}`);
+      copyToClipboard(result.path);
+      log(`  -> Copied to clipboard`);
+    } else {
+      log(`  -> Failed to save locally`);
+    }
+  } else {
+    const result = await pipeToRemote(imageBuffer, remote, filename);
+    if (result.success) {
+      log(`  -> Sent to ${remote}:${result.path}`);
+      setRemoteClipboard(remote, result.path, display);
+      log(`  -> Set remote clipboard`);
+      const localResult = saveLocal(imageBuffer, filename);
+      if (localResult.success) {
+        log(`  -> Local copy: ${localResult.path}`);
+      }
+    } else {
+      log(`  -> Failed to send to ${remote}`);
+      if (result.error) {
+        log(`  -> Error: ${result.error}`);
+      }
+    }
+  }
+}
+
 async function getClipboardImage(): Promise<Buffer | null> {
   if (isWindows || isWSL()) {
     return getClipboardImageWindows();
@@ -317,57 +408,44 @@ export async function startMonitor(remote: string): Promise<void> {
   const poll = async () => {
     try {
       const imageBuffer = await getClipboardImage();
-
-      if (!imageBuffer) {
-        return;
-      }
-
-      const currentHash = getImageHash(imageBuffer);
-
-      if (currentHash !== lastImageHash) {
-        lastImageHash = currentHash;
-
-        const filename = generateFilename();
-        const size = Math.round(imageBuffer.length / 1024);
-
-        log(`New screenshot: ${filename} (${size}KB)`);
-
-        if (remote === "local") {
-          const result = saveLocal(imageBuffer, filename);
-          if (result.success) {
-            log(`  -> Saved: ${result.path}`);
-            copyToClipboard(result.path);
-            log(`  -> Copied to clipboard`);
-          } else {
-            log(`  -> Failed to save locally`);
-          }
-        } else {
-          const result = await pipeToRemote(imageBuffer, remote, filename);
-          if (result.success) {
-            log(`  -> Sent to ${remote}:${result.path}`);
-            // Set the remote X clipboard so Ctrl+V works in Claude Code over SSH
-            setRemoteClipboard(remote, result.path, display);
-            log(`  -> Set remote clipboard`);
-            // Also save locally so the image is accessible on this machine
-            const localResult = saveLocal(imageBuffer, filename);
-            if (localResult.success) {
-              log(`  -> Local copy: ${localResult.path}`);
-            }
-          } else {
-            log(`  -> Failed to send to ${remote}`);
-            if (result.error) {
-              log(`  -> Error: ${result.error}`);
-            }
-          }
-        }
-      }
+      if (!imageBuffer) return;
+      await handleNewImage(imageBuffer, remote, display);
     } catch (err) {
       log(`Error: ${err}`);
     }
   };
 
-  // Start polling
-  setInterval(poll, POLL_INTERVAL_MS);
+  // On macOS, use a single persistent osascript process instead of spawning one per poll
+  let usingHelper = false;
+  if (isMacOS) {
+    const helper = startMacClipboardHelper();
+    if (helper) {
+      usingHelper = true;
+      log("Using clipboard helper");
+      const rl = readline.createInterface({ input: helper.stdout! });
+      rl.on("line", async (line: string) => {
+        if (line.startsWith("IMAGE ")) {
+          const imgPath = line.slice(6);
+          try {
+            if (!fs.existsSync(imgPath)) return;
+            const imageBuffer = fs.readFileSync(imgPath);
+            try { fs.unlinkSync(imgPath); } catch {}
+            if (imageBuffer.length === 0) return;
+            await handleNewImage(imageBuffer, remote, display);
+          } catch (err) {
+            log(`Error: ${err}`);
+          }
+        }
+      });
+      helper.on("exit", () => {
+        log("Clipboard helper exited, falling back to polling");
+        setInterval(poll, POLL_INTERVAL_MS);
+      });
+    }
+  }
+  if (!usingHelper) {
+    setInterval(poll, POLL_INTERVAL_MS);
+  }
 
   // Keep process running
   await new Promise(() => {});
